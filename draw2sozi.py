@@ -20,6 +20,10 @@ Regeln:
   * Die Reihenfolge innerhalb einer Ebene bleibt wie in der Zeichnung.
   * Überlappende Formen, deren Stapelreihenfolge sich dadurch ändert, werden
     gemeldet.
+  * Hat eine Form oder Gruppe in Draw einen Namen (Rechtsklick → Name…), wird
+    dieser Name ihre ID im SVG. Sozi-Rahmen, die an der Form verankert sind,
+    bleiben so auch nach Änderungen in Draw an der richtigen Form. Ungültige,
+    doppelte oder schon vergebene Namen werden gemeldet und nicht übernommen.
 
 Voraussetzungen: Python 3.8+, Paket defusedxml (pip install defusedxml),
 für den automatischen Export LibreOffice (soffice).
@@ -132,6 +136,7 @@ def read_odg(odg_path):
         items.append({
             "art": ART.get(typ, typ),
             "tag": tag,
+            "el": el,
             "layers": layers,
             "x": length_hmm(el.get(OS + "x")),
             "y": length_hmm(el.get(OS + "y")),
@@ -238,6 +243,78 @@ def xml_id(name, used):
     return cand
 
 
+NCNAME = re.compile(r"[^\W\d][\w.-]*")
+
+
+def shape_target(g):
+    """Element, das im SVG die ID einer Form trägt (bei Gruppen die Gruppe selbst)."""
+    if g.get("class") == "Group":
+        return g
+    inner = next((c for c in g if c.tag == S + "g" and c.get("id")), None)
+    return inner if inner is not None else g
+
+
+def collect_names(odg_el, svg_g, out, meldungen):
+    """Paare (Name aus Draw, SVG-Element) sammeln, rekursiv in Gruppen."""
+    name = odg_el.get(D + "name")
+    if name:
+        out.append((name, shape_target(svg_g)))
+    if odg_el.tag == D + "g":
+        odg_kids = [c for c in odg_el if c.tag.startswith(D)]
+        svg_kids = [c for c in svg_g if c.tag == S + "g"]
+        if len(odg_kids) != len(svg_kids):
+            meldungen.append(f"Hinweis: Gruppe «{name or 'ohne Namen'}» hat in .odg und SVG unterschiedlich "
+                             "viele Formen – Namen darin werden nicht übernommen.")
+            return
+        for o, s in zip(odg_kids, svg_kids):
+            collect_names(o, s, out, meldungen)
+
+
+def apply_names(root, pairs, reserved, meldungen):
+    """Namen aus Draw als feste IDs setzen und Verweise im SVG nachführen.
+
+    Ungültige, doppelte oder mit anderen IDs kollidierende Namen werden nicht
+    übernommen und gemeldet; die Form behält dann die ID von LibreOffice.
+    """
+    count = {}
+    for name, _ in pairs:
+        count[name] = count.get(name, 0) + 1
+    renamed = {}
+    gesetzt = 0
+    gemeldet = set()
+    for name, el in pairs:
+        if not NCNAME.fullmatch(name):
+            meldungen.append(f"Name «{name}» ist als ID ungültig (erlaubt: Buchstaben, Ziffern, _ . -, "
+                             "nicht mit Ziffer beginnend) – nicht übernommen.")
+            continue
+        if count[name] > 1:
+            if name not in gemeldet:
+                meldungen.append(f"Name «{name}» kommt {count[name]}-mal vor – nicht übernommen.")
+                gemeldet.add(name)
+            continue
+        old = el.get("id")
+        if name == old:
+            continue
+        if name in reserved:
+            meldungen.append(f"Name «{name}» ist schon als ID vergeben (z. B. Ebene) – nicht übernommen.")
+            continue
+        el.set("id", name)
+        gesetzt += 1
+        if old:
+            renamed[old] = name
+    if renamed:
+        # Verweise nachführen: ooo:id-list, xlink:href="#…", url(#…)
+        token = re.compile(r"(?<![\w.-])(" + "|".join(re.escape(k) for k in renamed) + r")(?![\w.-])")
+        for e in root.iter():
+            for k, v in list(e.attrib.items()):
+                if k == "id":
+                    continue
+                nv = token.sub(lambda m: renamed[m.group(1)], v)
+                if nv != v:
+                    e.set(k, nv)
+    return gesetzt
+
+
 def overlaps(a, b):
     return (a and b and a[0] < b[0] + b[2] and b[0] < a[0] + a[2]
             and a[1] < b[1] + b[3] and b[1] < a[1] + a[3])
@@ -292,6 +369,18 @@ def build(odg_path, svg_bytes, gruppen_oben=True, toleranz_mm=0.5):
                 meldungen.append(f"Stapelung geändert: {ia} (Ebene {za}) lag unter {ib} "
                                  f"(Ebene {zb}) und liegt jetzt darüber.")
 
+    # IDs der Ebenen festlegen, danach Namen aus Draw als feste IDs der Formen
+    used_ids = {e.get("id") for e in root.iter() if e.get("id")}
+    hat_master = master is not None and any(len(c) for c in master if c.get("class") == "BackgroundObjects")
+    master_id = xml_id("Masterseite", used_ids) if hat_master else None
+    layer_ids = {l: xml_id(l, used_ids) for l in belegt}
+    namen = []
+    for it, (_, _, g, _) in zip(items, zuordnung):
+        collect_names(it["el"], g, namen, meldungen)
+    n_ids = apply_names(root, namen, used_ids, meldungen)
+    if n_ids:
+        meldungen.insert(0, f"Feste IDs aus Namen in Draw: {n_ids}")
+
     # Neues SVG aufbauen
     for p, uri in (("", NS["svg"]), ("xlink", NS["xlink"]), ("ooo", NS["ooo"]),
                    ("inkscape", NS["inkscape"])):
@@ -302,16 +391,15 @@ def build(odg_path, svg_bytes, gruppen_oben=True, toleranz_mm=0.5):
             new.append(child)
     clip = slide.get("clip-path") if slide is not None else None
 
-    used_ids = {e.get("id") for e in root.iter() if e.get("id")}
     statistik = []
-    if master is not None and any(len(c) for c in master if c.get("class") == "BackgroundObjects"):
-        mg = ET.SubElement(new, S + "g", {"id": xml_id("Masterseite", used_ids),
+    if hat_master:
+        mg = ET.SubElement(new, S + "g", {"id": master_id,
                                           "{%s}groupmode" % NS["inkscape"]: "layer",
                                           "{%s}label" % NS["inkscape"]: "Masterseite"})
         mg.append(master)
         statistik.append(("Masterseite", 1))
     for l in belegt:
-        attrs = {"id": xml_id(l, used_ids),
+        attrs = {"id": layer_ids[l],
                  "{%s}groupmode" % NS["inkscape"]: "layer",
                  "{%s}label" % NS["inkscape"]: l}
         if clip:
@@ -336,6 +424,10 @@ def main(argv=None):
     ap.add_argument("--gruppen-unten", action="store_true",
                     help=f"Ebene «{GRUPPEN_EBENE}» zuunterst statt zuoberst")
     a = ap.parse_args(argv)
+    # Umgeleitete Ausgabe (Datei, Pipe) nutzt unter Windows oft cp1252: nicht abstürzen
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace")
 
     try:
         if not os.path.isfile(a.odg):
