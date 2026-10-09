@@ -50,3 +50,7 @@ Windows 11, LibreOffice 26.2.6.3, Python 3.14, Sozi 24.11 (Entwicklungsstand):
 Formen, Gruppen über mehrere Ebenen, Textrahmen, Beschriftung in Formen,
 eingebettete Bilder, Verbinder, Masslinien, gedrehte Formen, mehrere Seiten
 (Abbruch).
+
+## Lizenz
+
+[Mozilla Public License 2.0](LICENSE), wie Sozi.
