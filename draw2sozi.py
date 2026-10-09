@@ -9,6 +9,7 @@ mit ID direkt unter der SVG-Wurzel ist. Sozi erkennt solche Gruppen als Ebenen.
 Aufruf:
     python draw2sozi.py zeichnung.odg                 # SVG-Export über LibreOffice
     python draw2sozi.py zeichnung.odg --svg export.svg # vorhandenen Export verwenden
+    python draw2sozi.py zeichnung.odg --watch          # nach jedem Speichern neu erzeugen
 
 Ausgabe: zeichnung.sozi-ebenen.svg (oder --out)
 
@@ -38,6 +39,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import zipfile
 import xml.etree.ElementTree as ET  # nur zum Erzeugen/Schreiben, nicht zum Parsen fremder Daten
 
@@ -423,20 +425,23 @@ def build(odg_path, svg_bytes, gruppen_oben=True, toleranz_mm=0.5):
     return new, statistik, leer, meldungen
 
 
-def main(argv=None):
-    ap = argparse.ArgumentParser(description="Ebenen aus LibreOffice Draw für Sozi/Inkscape ins SVG übertragen.")
-    ap.add_argument("odg", help="Draw-Datei (.odg)")
-    ap.add_argument("--svg", help="vorhandener SVG-Export derselben Zeichnung (sonst Export über LibreOffice)")
-    ap.add_argument("--out", help="Ausgabedatei (Standard: <name>.sozi-ebenen.svg)")
-    ap.add_argument("--soffice", help="Pfad zu soffice bzw. soffice.exe")
-    ap.add_argument("--gruppen-unten", action="store_true",
-                    help=f"Ebene «{GRUPPEN_EBENE}» zuunterst statt zuoberst")
-    a = ap.parse_args(argv)
-    # Umgeleitete Ausgabe (Datei, Pipe) nutzt unter Windows oft cp1252: nicht abstürzen
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            stream.reconfigure(errors="replace")
+def write_atomic(tree, out):
+    """SVG erst in eine Zwischendatei schreiben, dann ersetzen: Sozi liest nie eine halbe Datei."""
+    fd, tmp = tempfile.mkstemp(prefix=".draw2sozi-", suffix=".tmp", dir=os.path.dirname(os.path.abspath(out)))
+    try:
+        with os.fdopen(fd, "wb") as f:
+            tree.write(f, encoding="UTF-8", xml_declaration=True)
+        os.replace(tmp, out)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
+
+def run_once(a):
+    """Eine Umwandlung; gibt den Rückgabewert für das Programm zurück."""
     try:
         if not os.path.isfile(a.odg):
             raise Abbruch(f"Datei nicht gefunden: {a.odg}")
@@ -449,7 +454,7 @@ def main(argv=None):
         out = a.out or os.path.splitext(a.odg)[0] + ".sozi-ebenen.svg"
         if os.path.abspath(out) in (os.path.abspath(a.odg), os.path.abspath(a.svg or "")):
             raise Abbruch("Ausgabedatei würde eine Eingabedatei überschreiben.")
-        ET.ElementTree(new).write(out, encoding="UTF-8", xml_declaration=True)
+        write_atomic(ET.ElementTree(new), out)
     except (Abbruch, zipfile.BadZipFile, ET.ParseError) as e:
         print(f"Abbruch: {e}", file=sys.stderr)
         return 2
@@ -466,6 +471,65 @@ def main(argv=None):
     for m in meldungen:
         print("  " + m)
     return 0
+
+
+def file_state(path):
+    try:
+        st = os.stat(path)
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def watch(a, interval=1.0):
+    """Nach jedem Speichern der .odg neu umwandeln, bis Strg+C."""
+    print(f"Überwache {a.odg} – Beenden mit Strg+C.")
+    run_once(a)
+    last = file_state(a.odg)
+    try:
+        while True:
+            time.sleep(interval)
+            state = file_state(a.odg)
+            if state is None or state == last:
+                continue
+            # Warten, bis LibreOffice fertig geschrieben hat (Grösse und Zeit stabil)
+            while True:
+                time.sleep(interval)
+                again = file_state(a.odg)
+                if again == state:
+                    break
+                state = again
+            last = state
+            print(f"\n[{time.strftime('%H:%M:%S')}] Änderung erkannt.")
+            run_once(a)
+    except KeyboardInterrupt:
+        print("\nÜberwachung beendet.")
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Ebenen aus LibreOffice Draw für Sozi/Inkscape ins SVG übertragen.")
+    ap.add_argument("odg", help="Draw-Datei (.odg)")
+    ap.add_argument("--svg", help="vorhandener SVG-Export derselben Zeichnung (sonst Export über LibreOffice)")
+    ap.add_argument("--out", help="Ausgabedatei (Standard: <name>.sozi-ebenen.svg)")
+    ap.add_argument("--soffice", help="Pfad zu soffice bzw. soffice.exe")
+    ap.add_argument("--gruppen-unten", action="store_true",
+                    help=f"Ebene «{GRUPPEN_EBENE}» zuunterst statt zuoberst")
+    ap.add_argument("--watch", action="store_true",
+                    help="die .odg überwachen und nach jedem Speichern neu umwandeln (Ende mit Strg+C)")
+    a = ap.parse_args(argv)
+    # Umgeleitete Ausgabe (Datei, Pipe) nutzt unter Windows oft cp1252: nicht abstürzen
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace", line_buffering=True)  # --watch: Meldungen sofort zeigen
+
+    if a.watch:
+        if a.svg:
+            print("Abbruch: --watch und --svg schliessen sich aus (der Export muss jedes Mal neu entstehen).",
+                  file=sys.stderr)
+            return 2
+        return watch(a)
+    return run_once(a)
 
 
 if __name__ == "__main__":
