@@ -20,6 +20,7 @@ Regeln:
   * Die Reihenfolge innerhalb einer Ebene bleibt wie in der Zeichnung.
   * Überlappende Formen, deren Stapelreihenfolge sich dadurch ändert, werden
     gemeldet.
+  * Fehlt im SVG ein Titel, wird der Dateiname (ohne Endung) eingetragen.
   * Hat eine Form oder Gruppe in Draw einen Namen (Rechtsklick → Name…), wird
     dieser Name ihre ID im SVG. Sozi-Rahmen, die an der Form verankert sind,
     bleiben so auch nach Änderungen in Draw an der richtigen Form. Ungültige,
@@ -389,6 +390,13 @@ def build(odg_path, svg_bytes, gruppen_oben=True, toleranz_mm=0.5):
     for child in root:
         if child.tag == S + "defs" or child.tag == S + "title":
             new.append(child)
+    # Titel: Sozi zeigt sonst «Untitled». Ein leeres <title> liesse Sozi beim Laden abbrechen.
+    titel_el = new.find(S + "title")
+    if titel_el is None:
+        titel_el = ET.Element(S + "title")
+        new.insert(0, titel_el)
+    if not (titel_el.text or "").strip():
+        titel_el.text = os.path.splitext(os.path.basename(odg_path))[0]
     clip = slide.get("clip-path") if slide is not None else None
 
     statistik = []
